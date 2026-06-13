@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>商品よみあげ</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #ffffff;
+      color: #000000;
+      font-family: -apple-system, "Hiragino Kaku Gothic ProN", sans-serif;
+      -webkit-text-size-adjust: 100%;
+    }
+    body {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+
+    /* ========== セットアップ画面 ========== */
+    #setupScreen {
+      width: 100%;
+      max-width: 520px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    #setupScreen h1 {
+      font-size: 32px;
+      margin: 0;
+      text-align: center;
+    }
+    #setupScreen p {
+      font-size: 22px;
+      line-height: 1.6;
+      margin: 0;
+      color: #333;
+    }
+    #apiKeyInput {
+      width: 100%;
+      font-size: 22px;
+      padding: 16px;
+      border: 4px solid #0a5ad6;
+      border-radius: 16px;
+      box-sizing: border-box;
+    }
+    #saveButton {
+      width: 100%;
+      min-height: 100px;
+      font-size: 36px;
+      font-weight: bold;
+      color: #ffffff;
+      background: #0a5ad6;
+      border: 4px solid #003a8c;
+      border-radius: 20px;
+      cursor: pointer;
+    }
+    #saveButton:active { background: #003a8c; }
+    #setupError {
+      font-size: 22px;
+      color: #c00000;
+      text-align: center;
+      min-height: 1.4em;
+    }
+
+    /* ========== メイン画面 ========== */
+    #mainScreen {
+      width: 100%;
+      max-width: 520px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0;
+    }
+    #shootButton {
+      width: 100%;
+      min-height: 200px;
+      font-size: 44px;
+      font-weight: bold;
+      line-height: 1.3;
+      color: #ffffff;
+      background: #0a5ad6;
+      border: 6px solid #003a8c;
+      border-radius: 28px;
+      padding: 24px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #shootButton:active  { background: #003a8c; }
+    #shootButton:focus   { outline: 6px solid #ff8c00; outline-offset: 4px; }
+    #shootButton:disabled { background: #888; border-color: #555; }
+
+    #status {
+      margin-top: 28px;
+      font-size: 34px;
+      font-weight: bold;
+      text-align: center;
+      min-height: 1.4em;
+    }
+    #result {
+      margin-top: 20px;
+      font-size: 40px;
+      font-weight: bold;
+      text-align: center;
+      line-height: 1.4;
+    }
+    .error { color: #c00000 !important; }
+
+    /* キーをリセットするリンク（小さく目立たせない） */
+    #resetKeyLink {
+      margin-top: 40px;
+      font-size: 18px;
+      color: #888;
+      text-decoration: underline;
+      cursor: pointer;
+      background: none;
+      border: none;
+      padding: 0;
+    }
+
+    /* 非表示カメラ入力 */
+    #fileInput {
+      position: absolute;
+      width: 1px; height: 1px;
+      opacity: 0; pointer-events: none;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <!-- ========== セットアップ画面（初回のみ）========== -->
+  <div id="setupScreen">
+    <h1>🔑 初回設定</h1>
+    <p>Gemini APIキーを入力して「保存する」を押してください。<br>次回からは不要です。</p>
+    <input
+      id="apiKeyInput"
+      type="text"
+      inputmode="text"
+      autocomplete="off"
+      autocorrect="off"
+      autocapitalize="none"
+      spellcheck="false"
+      placeholder="AIzaSy..."
+      aria-label="Gemini APIキーを入力してください"
+    >
+    <button id="saveButton">保存する</button>
+    <div id="setupError" role="alert" aria-live="assertive"></div>
+  </div>
+
+  <!-- ========== メイン画面 ========== -->
+  <div id="mainScreen" class="hidden">
+    <button
+      id="shootButton"
+      aria-label="写真を撮って商品名を読み上げます。ボタンを押すとカメラが開きます。"
+    >
+      写真を撮って読む
+    </button>
+
+    <div id="status"  role="status" aria-live="assertive"></div>
+    <div id="result"  role="status" aria-live="polite"></div>
+
+    <button id="resetKeyLink" aria-label="APIキーをリセットします">
+      APIキーを変更する
+    </button>
+  </div>
+
+  <!-- 背面カメラ入力 -->
+  <input id="fileInput" type="file" accept="image/*" capture="environment" aria-hidden="true" tabindex="-1">
+
+  <script>
+    // ===== 設定 =====
+    const STORAGE_KEY  = "gemini_api_key";
+    const GEMINI_MODEL = "gemini-2.5-flash";
+    const PROMPT = [
+      "この画像に写っている商品の名前を、日本語で短く答えてください。",
+      "視覚障害者が買い物中に聞く前提です。",
+      "商品名・用途だけを優先してください。",
+      "余計な説明はしないでください。",
+      "分からない場合は「商品名がはっきり分かりません」と答えてください。",
+      "読み上げやすいように、できるだけ短くしてください。",
+      "回答例：スクラビングバブル、トイレスタンプです。"
+    ].join("\n");
+
+    // ===== 要素取得 =====
+    const setupScreen  = document.getElementById("setupScreen");
+    const mainScreen   = document.getElementById("mainScreen");
+    const apiKeyInput  = document.getElementById("apiKeyInput");
+    const saveButton   = document.getElementById("saveButton");
+    const setupError   = document.getElementById("setupError");
+    const shootButton  = document.getElementById("shootButton");
+    const fileInput    = document.getElementById("fileInput");
+    const statusEl     = document.getElementById("status");
+    const resultEl     = document.getElementById("result");
+    const resetKeyLink = document.getElementById("resetKeyLink");
+
+    // ===== 画面切り替え =====
+    function showSetup() {
+      setupScreen.classList.remove("hidden");
+      mainScreen.classList.add("hidden");
+    }
+    function showMain() {
+      setupScreen.classList.add("hidden");
+      mainScreen.classList.remove("hidden");
+    }
+
+    // ===== 起動時：キーが保存済みならメイン画面へ =====
+    const savedKey = localStorage.getItem(STORAGE_KEY);
+    if (savedKey) {
+      showMain();
+    } else {
+      showSetup();
+    }
+
+    // ===== セットアップ：保存ボタン =====
+    saveButton.addEventListener("click", function () {
+      const key = apiKeyInput.value.trim();
+      if (!key || key.length < 10) {
+        setupError.textContent = "キーを入力してください。";
+        return;
+      }
+      localStorage.setItem(STORAGE_KEY, key);
+      setupError.textContent = "";
+      showMain();
+    });
+
+    // ===== キーをリセット =====
+    resetKeyLink.addEventListener("click", function () {
+      if (confirm("APIキーをリセットしますか？")) {
+        localStorage.removeItem(STORAGE_KEY);
+        apiKeyInput.value = "";
+        showSetup();
+      }
+    });
+
+    // ===== 音声読み上げ =====
+    function speak(text) {
+      try {
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang  = "ja-JP";
+        u.rate  = 0.95;
+        u.pitch = 1.0;
+        window.speechSynthesis.speak(u);
+      } catch (e) {}
+    }
+
+    function setStatus(text, isError) {
+      statusEl.textContent = text;
+      statusEl.className = isError ? "error" : "";
+    }
+    function setResult(text) {
+      resultEl.textContent = text;
+    }
+
+    // ===== 撮影ボタン =====
+    shootButton.addEventListener("click", function () {
+      try { window.speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); } catch (e) {}
+      setResult("");
+      setStatus("");
+      fileInput.value = "";
+      fileInput.click();
+    });
+
+    // ===== 撮影後の処理 =====
+    fileInput.addEventListener("change", async function () {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+
+      const apiKey = localStorage.getItem(STORAGE_KEY);
+      if (!apiKey) { showSetup(); return; }
+
+      shootButton.disabled = true;
+      setResult("");
+      setStatus("読み取り中です");
+      speak("読み取り中です");
+
+      try {
+        const base64 = await fileToBase64(file);
+        const name   = await askGemini(base64, file.type || "image/jpeg", apiKey);
+        setStatus("");
+        setResult(name);
+        speak(name);
+      } catch (e) {
+        const msg = "読み取りに失敗しました。もう一度撮影してください";
+        setStatus(msg, true);
+        setResult("");
+        speak(msg);
+      } finally {
+        shootButton.disabled = false;
+      }
+    });
+
+    // ===== 画像 → Base64 =====
+    function fileToBase64(file) {
+      return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onload  = function () {
+          const r = String(reader.result);
+          const i = r.indexOf(",");
+          resolve(i >= 0 ? r.slice(i + 1) : r);
+        };
+        reader.onerror = function () { reject(new Error("read error")); };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // ===== Gemini API呼び出し =====
+    async function askGemini(base64, mimeType, apiKey) {
+      const url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                + GEMINI_MODEL + ":generateContent?key=" + apiKey;
+
+      const body = {
+        contents: [{
+          parts: [
+            { text: PROMPT },
+            { inline_data: { mime_type: mimeType, data: base64 } }
+          ]
+        }]
+      };
+
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      if (!res.ok) throw new Error("api error " + res.status);
+
+      const data = await res.json();
+      let text = "";
+      try {
+        text = data.candidates[0].content.parts
+          .map(function (p) { return p.text || ""; })
+          .join("").trim();
+      } catch (e) { text = ""; }
+
+      return text || "商品名がはっきり分かりません";
+    }
+  </script>
+</body>
+</html>
