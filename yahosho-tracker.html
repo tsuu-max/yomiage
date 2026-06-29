@@ -36,25 +36,22 @@
     const GAS_URL = "https://script.google.com/macros/s/AKfycbyRx7xAf8RfgP-vCARImSWTOy0sxLnsi8unCABfyLIhOjLLYvCj3NL6AePS-CAX2NuK/exec";
 
     function syncToSheets(o, accName) {
-      fetch(GAS_URL, {
-        method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain" },
-        body: JSON.stringify({
-          date:      o.date,
-          account:   accName,
-          store:     o.store,
-          orderId:   o.orderId,
-          item:      o.item,
-          gross:     o.gross,
-          coupon:    o.coupon,
-          pointUsed: o.pointUsed,
-          cash:      o.cash,
-          estP:      o.estP,
-          actP:      o.actP,
-          status:    o.status,
-        }),
-      }).catch(() => {});
+      const payload = JSON.stringify({
+        date:      o.date,
+        account:   accName,
+        store:     o.store,
+        orderId:   o.orderId,
+        item:      o.item,
+        gross:     o.gross,
+        coupon:    o.coupon,
+        pointUsed: o.pointUsed,
+        cash:      o.cash,
+        estP:      o.estP,
+        actP:      o.actP,
+        status:    o.status,
+      });
+      const url = GAS_URL + "?payload=" + encodeURIComponent(payload);
+      fetch(url, { mode: "no-cors" }).catch(() => {});
     }
 
     function loadState() {
