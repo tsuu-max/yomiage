@@ -13,11 +13,19 @@
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>
+    // classic JSX runtime: Reactをグローバルとして使い、import文を生成しない
+    Babel.registerPreset('jsx-classic', {
+      presets: [
+        [Babel.availablePresets['react'], { runtime: 'classic' }]
+      ]
+    });
+  </script>
 </head>
 <body class="bg-zinc-950">
   <div id="root"></div>
 
-  <script type="text/babel" data-presets="env,react">
+  <script type="text/babel" data-presets="jsx-classic">
     const { useState, useEffect, useMemo, useRef } = React;
 
     /* ================================================================== *
