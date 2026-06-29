@@ -1,0 +1,603 @@
+import { useState, useEffect, useMemo, useRef } from "react";
+import { LayoutGrid, PlusCircle, Settings, ScrollText, Trash2, Flag, Copy, AlertTriangle, Calculator } from "lucide-react";
+
+/* ================================================================== *
+ *  ヤフショ 複垢 ポイント枠＆月次トラッカー  v2
+ *  - 枠管理: 予定P = min(対象額 × 率, 残上限) で「次どの垢」を即決
+ *  - 金の流れ: 商品合計 / クーポン / ポイント利用(今すぐ) / 現金支払 / 獲得P
+ *  - 月次タブ: 税理士が見やすい列＋月別集計＋CSV
+ * ================================================================== */
+
+const STORAGE_KEY = "yahoo-cap-tracker:state-v1";
+let MEM = null;
+
+async function loadState() {
+  try {
+    if (typeof window !== "undefined" && window.storage) {
+      const r = await window.storage.get(STORAGE_KEY);
+      if (r && r.value) return JSON.parse(r.value);
+    }
+  } catch (e) {}
+  return MEM;
+}
+async function saveState(state) {
+  MEM = state;
+  try {
+    if (typeof window !== "undefined" && window.storage) {
+      await window.storage.set(STORAGE_KEY, JSON.stringify(state));
+    }
+  } catch (e) {}
+}
+
+const DEFAULT_CAMPAIGNS = [
+  { id: "daily5", name: "毎日5%(LINE連携)", rate: 5, cap: 0, period: "month", auto: "always", entry: false, minOrder: 0, enabled: true },
+  { id: "lyp", name: "LYP +2%", rate: 2, cap: 5000, period: "month", auto: "always", entry: false, minOrder: 0, enabled: true },
+  { id: "store", name: "ストアP", rate: 1, cap: 0, period: "month", auto: "always", entry: false, minOrder: 0, enabled: true },
+  { id: "day5", name: "5のつく日 +4%", rate: 4, cap: 1000, period: "day", auto: "day5", entry: true, minOrder: 0, enabled: true },
+  { id: "sunday", name: "プレミアムな日曜日 +5%", rate: 5, cap: 2000, period: "day", auto: "sunday", entry: true, minOrder: 5000, enabled: true },
+  { id: "bakugai", name: "爆買WEEK +4〜7%", rate: 5, cap: 3000, period: "day", auto: "manual", entry: true, minOrder: 0, enabled: false },
+];
+
+const DEFAULT_ACCOUNTS = Array.from({ length: 20 }, (_, i) => ({
+  id: "a" + String(i + 1).padStart(2, "0"),
+  name: "垢" + String(i + 1).padStart(2, "0"),
+}));
+
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const yen = (n) => Math.round(n || 0).toLocaleString("ja-JP");
+const periodKey = (date, period) =>
+  period === "month" ? date.slice(0, 7) : period === "day" ? date : "all";
+
+function autoApplies(camp, date) {
+  if (!camp.enabled) return false;
+  if (camp.auto === "always") return true;
+  const d = new Date(date + "T00:00:00");
+  if (camp.auto === "day5") return [5, 15, 25].includes(d.getDate());
+  if (camp.auto === "sunday") return d.getDay() === 0;
+  return false;
+}
+
+// v1台帳の後方互換
+function migrate(o) {
+  const gross = o.gross ?? o.amount ?? 0;
+  const coupon = o.coupon ?? 0;
+  const pointUsed = o.pointUsed ?? 0;
+  return {
+    id: o.id, accountId: o.accountId, date: o.date,
+    store: o.store ?? "", orderId: o.orderId ?? "", item: o.item ?? "",
+    gross, coupon, pointUsed,
+    cash: o.cash ?? Math.max(0, gross - coupon - pointUsed),
+    taisho: o.taisho ?? Math.max(0, gross - coupon),
+    estBreakdown: o.estBreakdown ?? o.breakdown ?? [],
+    estP: o.estP ?? o.total ?? 0,
+    actP: o.actP ?? null,
+    status: o.status ?? "処理中",
+  };
+}
+
+export default function App() {
+  const [tab, setTab] = useState("input");
+  const [campaigns, setCampaigns] = useState(DEFAULT_CAMPAIGNS);
+  const [accounts, setAccounts] = useState(DEFAULT_ACCOUNTS);
+  const [orders, setOrders] = useState([]);
+  const [ready, setReady] = useState(false);
+  const [toast, setToast] = useState("");
+  const firstLoad = useRef(true);
+
+  useEffect(() => {
+    (async () => {
+      const s = await loadState();
+      if (s) {
+        setCampaigns(s.campaigns || DEFAULT_CAMPAIGNS);
+        setAccounts(s.accounts || DEFAULT_ACCOUNTS);
+        setOrders((s.orders || []).map(migrate));
+      }
+      setReady(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    if (firstLoad.current) { firstLoad.current = false; return; }
+    saveState({ campaigns, accounts, orders });
+  }, [campaigns, accounts, orders, ready]);
+
+  const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 1800); };
+
+  const consumed = (accountId, campId, period, dKey, excludeId) => {
+    let sum = 0;
+    for (const o of orders) {
+      if (o.accountId !== accountId || (excludeId && o.id === excludeId)) continue;
+      if (periodKey(o.date, period) !== dKey) continue;
+      const b = o.estBreakdown?.find((x) => x.campId === campId);
+      if (b) sum += b.applied;
+    }
+    return sum;
+  };
+
+  const calcOrder = (accountId, date, taisho, selectedIds, excludeId) => {
+    const breakdown = []; let total = 0;
+    for (const c of campaigns) {
+      if (!selectedIds.includes(c.id)) continue;
+      if (c.minOrder && taisho < c.minOrder) continue;
+      const raw = Math.round(taisho * (c.rate / 100));
+      let applied = raw;
+      if (c.cap > 0) {
+        const used = consumed(accountId, c.id, c.period, periodKey(date, c.period), excludeId);
+        applied = Math.max(0, Math.min(raw, c.cap - used));
+      }
+      breakdown.push({ campId: c.id, name: c.name, rate: c.rate, raw, applied, capped: applied < raw });
+      total += applied;
+    }
+    return { breakdown, total };
+  };
+
+  return (
+    <div className="min-h-screen w-full bg-zinc-950 text-zinc-100 font-sans antialiased">
+      <style>{`@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+        .num{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}`}</style>
+
+      <header className="sticky top-0 z-20 border-b border-zinc-800 bg-zinc-950/90 backdrop-blur">
+        <div className="mx-auto max-w-5xl px-4 py-3 flex items-center gap-3">
+          <div className="h-7 w-7 rounded bg-teal-400 flex items-center justify-center text-zinc-950 font-bold">P</div>
+          <div className="flex-1">
+            <div className="text-sm font-semibold tracking-tight">ヤフショ 複垢 ポイント枠＆月次トラッカー</div>
+            <div className="text-[11px] text-zinc-500">残枠で垢を選ぶ／現金支払・利用P・獲得Pを月別に記録</div>
+          </div>
+          <div className="text-[10px] text-zinc-600 num">{ready ? "保存ON" : "…"}</div>
+        </div>
+        <nav className="mx-auto max-w-5xl px-2 flex gap-1 text-sm">
+          {[
+            ["input", "注文入力", PlusCircle],
+            ["dash", "枠ダッシュボード", LayoutGrid],
+            ["month", "月次台帳（税理士用）", ScrollText],
+            ["settings", "設定", Settings],
+          ].map(([id, label, Icon]) => (
+            <button key={id} onClick={() => setTab(id)}
+              className={`flex items-center gap-1.5 px-3 py-2 -mb-px border-b-2 transition ${
+                tab === id ? "border-teal-400 text-zinc-100" : "border-transparent text-zinc-500 hover:text-zinc-300"}`}>
+              <Icon size={15} strokeWidth={2} /> <span className="hidden sm:inline">{label}</span>
+            </button>
+          ))}
+        </nav>
+      </header>
+
+      <main className="mx-auto max-w-5xl px-4 py-5">
+        {tab === "input" && <InputTab accounts={accounts} campaigns={campaigns} calcOrder={calcOrder}
+          onRecord={(o) => { setOrders((p) => [o, ...p]); flash("記録した"); setTab("month"); }} />}
+        {tab === "dash" && <DashTab accounts={accounts} campaigns={campaigns} orders={orders} consumed={consumed} />}
+        {tab === "month" && <MonthTab accounts={accounts} orders={orders}
+          onUpdate={(id, patch) => setOrders((p) => p.map((o) => o.id === id ? { ...o, ...patch } : o))}
+          onDelete={(id) => setOrders((p) => p.filter((o) => o.id !== id))} flash={flash} />}
+        {tab === "settings" && <SettingsTab campaigns={campaigns} setCampaigns={setCampaigns}
+          accounts={accounts} setAccounts={setAccounts} orders={orders} flash={flash} />}
+      </main>
+
+      {toast && <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-30 rounded-md bg-teal-400 px-4 py-2 text-sm font-medium text-zinc-950 shadow-lg">{toast}</div>}
+    </div>
+  );
+}
+
+/* ----------------------------- 注文入力 ----------------------------- */
+function InputTab({ accounts, campaigns, calcOrder, onRecord }) {
+  const [accountId, setAccountId] = useState(accounts[0]?.id || "");
+  const [date, setDate] = useState(todayStr());
+  const [store, setStore] = useState("");
+  const [orderId, setOrderId] = useState("");
+  const [item, setItem] = useState("");
+  const [gross, setGross] = useState("");
+  const [coupon, setCoupon] = useState("");
+  const [pointUsed, setPointUsed] = useState("");
+  const [taishoEdit, setTaishoEdit] = useState("");
+  const [actP, setActP] = useState("");      // 獲得P確定（分かれば）
+  const [manual, setManual] = useState({});
+
+  const g = Number(gross) || 0;
+  const cp = Number(coupon) || 0;
+  const pu = Number(pointUsed) || 0;
+  const cash = Math.max(0, g - cp - pu);
+  const taisho = taishoEdit === "" ? Math.max(0, g - cp) : Number(taishoEdit) || 0;
+
+  const applicable = useMemo(() => campaigns.map((c) => {
+    const auto = autoApplies(c, date);
+    const checked = manual[c.id] !== undefined ? manual[c.id] : auto;
+    const blockedByMin = c.minOrder && taisho < c.minOrder;
+    return { c, auto, checked: checked && !blockedByMin, blockedByMin };
+  }), [campaigns, date, manual, taisho]);
+
+  const selectedIds = applicable.filter((x) => x.checked).map((x) => x.c.id);
+  const { breakdown, total: estP } = calcOrder(accountId, date, taisho, selectedIds);
+  const finalP = actP !== "" ? Number(actP) || 0 : estP;
+  const realCost = cash - finalP; // 管理用
+  const acc = accounts.find((a) => a.id === accountId);
+
+  const record = () => {
+    if (!accountId || g <= 0) return;
+    onRecord({
+      id: "o" + Date.now(), accountId, date, store, orderId, item: item || "(無題)",
+      gross: g, coupon: cp, pointUsed: pu, cash, taisho,
+      estBreakdown: breakdown, estP,
+      actP: actP !== "" ? Number(actP) : null,
+      status: actP !== "" ? "獲得済" : "処理中",
+    });
+    setStore(""); setOrderId(""); setItem(""); setGross(""); setCoupon(""); setPointUsed(""); setTaishoEdit(""); setActP(""); setManual({});
+  };
+
+  return (
+    <div className="grid md:grid-cols-2 gap-5">
+      <section className="space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="垢">
+            <select value={accountId} onChange={(e) => setAccountId(e.target.value)}
+              className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-sm focus:border-teal-400 focus:outline-none">
+              {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          </Field>
+          <Field label="注文日">
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
+              className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-sm num focus:border-teal-400 focus:outline-none" />
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="ストア名（任意）">
+            <input value={store} onChange={(e) => setStore(e.target.value)} placeholder="コジマYahoo!店"
+              className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-sm focus:border-teal-400 focus:outline-none" />
+          </Field>
+          <Field label="注文ID（任意）">
+            <input value={orderId} onChange={(e) => setOrderId(e.target.value)} placeholder="y-kojima-1940..."
+              className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-sm num focus:border-teal-400 focus:outline-none" />
+          </Field>
+        </div>
+        <Field label="商品名（任意）">
+          <input value={item} onChange={(e) => setItem(e.target.value)} placeholder="iPhone 17 Pro 256 / WXR18000BE"
+            className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-sm focus:border-teal-400 focus:outline-none" />
+        </Field>
+
+        <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 space-y-3">
+          <div className="text-[11px] uppercase tracking-wider text-zinc-500">支払い（円）</div>
+          <div className="grid grid-cols-3 gap-2">
+            <Field label="商品合計"><MoneyInput v={gross} set={setGross} ph="60110" /></Field>
+            <Field label="クーポン値引"><MoneyInput v={coupon} set={setCoupon} ph="1000" /></Field>
+            <Field label="ポイント利用" hint="今すぐ"><MoneyInput v={pointUsed} set={setPointUsed} ph="5363" accent /></Field>
+          </div>
+          <div className="flex items-center justify-between pt-1 border-t border-zinc-800">
+            <span className="text-xs text-zinc-400">現金支払（クレジット）</span>
+            <span className="num text-base font-semibold text-zinc-100">¥{yen(cash)}</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <Field label="適用キャンペーン（自動判定・手で切替可）">
+          <div className="space-y-1.5">
+            {applicable.map(({ c, auto, checked, blockedByMin }) => (
+              <label key={c.id} className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm cursor-pointer transition ${
+                checked ? "border-teal-500/50 bg-teal-500/5" : "border-zinc-800 bg-zinc-900/40"} ${blockedByMin ? "opacity-40" : ""}`}>
+                <input type="checkbox" checked={checked} disabled={blockedByMin}
+                  onChange={(e) => setManual((m) => ({ ...m, [c.id]: e.target.checked }))} className="accent-teal-400" />
+                <span className="flex-1">{c.name}</span>
+                {c.entry && <span className="text-[10px] text-amber-400 flex items-center gap-0.5"><Flag size={10} />ENT</span>}
+                {c.cap > 0 && <span className="text-[10px] text-zinc-500 num">上限{yen(c.cap)}</span>}
+              </label>
+            ))}
+          </div>
+        </Field>
+
+        <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">
+          <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-zinc-500 mb-2">
+            <Calculator size={12} /> 獲得P予定（上限調整後） — {acc?.name}
+          </div>
+          {breakdown.length === 0 ? <div className="text-sm text-zinc-600 py-3 text-center">商品合計を入れると出る</div> : (
+            <div className="space-y-1">
+              {breakdown.map((b) => (
+                <div key={b.campId} className="flex items-baseline gap-2 text-sm">
+                  <span className="flex-1 text-zinc-300">{b.name}</span>
+                  {b.capped && <span className="text-[10px] text-rose-400 flex items-center gap-0.5"><AlertTriangle size={10} />上限</span>}
+                  <span className="num text-zinc-100">+{yen(b.applied)}</span>
+                  {b.capped && <span className="num text-[11px] text-zinc-600 line-through">{yen(b.raw)}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="mt-3 pt-3 border-t border-zinc-800 space-y-2">
+            <Row label="獲得P予定"><span className="num text-teal-400 font-semibold">{yen(estP)}</span></Row>
+            <Field label="獲得P確定（獲得明細で分かれば上書き・任意）">
+              <MoneyInput v={actP} set={setActP} ph={`予定 ${yen(estP)}`} />
+            </Field>
+            <Row label="実質原価（管理用＝現金支払−獲得P）">
+              <span className="num font-semibold text-zinc-100">¥{yen(realCost)}</span>
+            </Row>
+          </div>
+        </div>
+
+        <button onClick={record} disabled={!accountId || g <= 0}
+          className="w-full rounded-md bg-teal-400 py-2.5 text-sm font-semibold text-zinc-950 hover:bg-teal-300 disabled:opacity-30 transition">
+          記録する
+        </button>
+        <p className="text-[11px] text-zinc-600 leading-relaxed">
+          現金支払＝商品合計−クーポン−ポイント利用。獲得Pは注文時の予定で記録し、後で「獲得明細」の確定値に月次台帳で上書きできる。税務上の扱い（利用P・獲得Pの計上方法）は税理士の判断に従って。これは記録用ツール。
+        </p>
+      </section>
+    </div>
+  );
+}
+
+/* --------------------------- 枠ダッシュボード --------------------------- */
+function DashTab({ accounts, campaigns, orders, consumed }) {
+  const [date, setDate] = useState(todayStr());
+  const capped = campaigns.filter((c) => c.enabled && c.cap > 0);
+  const dayCamps = capped.filter((c) => c.period === "day" && autoApplies(c, date));
+  const monthCamps = capped.filter((c) => c.period === "month");
+
+  const rows = accounts.map((a) => {
+    const frames = [...monthCamps, ...dayCamps].map((c) => {
+      const dKey = periodKey(date, c.period);
+      const used = consumed(a.id, c.id, c.period, dKey);
+      return { c, remain: Math.max(0, c.cap - used) };
+    });
+    const ym = date.slice(0, 7);
+    const monthOrders = orders.filter((o) => o.accountId === a.id && o.date.slice(0, 7) === ym);
+    const monthP = monthOrders.reduce((s, o) => s + (o.actP ?? o.estP), 0);
+    return { a, frames, monthP, monthCount: monthOrders.length, headroom: frames.reduce((s, f) => s + f.remain, 0) };
+  });
+  const sorted = [...rows].sort((x, y) => y.headroom - x.headroom);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] uppercase tracking-wider text-zinc-500">基準日</span>
+          <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
+            className="rounded-md bg-zinc-900 border border-zinc-700 px-2 py-1 text-sm num focus:border-teal-400 focus:outline-none" />
+        </div>
+        <div className="text-[11px] text-zinc-500">
+          {dayCamps.length > 0 ? <>本日の日次枠：{dayCamps.map((c) => c.name).join("・")}</> : "本日は日次キャンペーンなし"}
+        </div>
+      </div>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {sorted.map(({ a, frames, monthP, monthCount, headroom }, i) => (
+          <div key={a.id} className={`rounded-lg border p-3 ${headroom > 0 ? "border-zinc-800 bg-zinc-900/40" : "border-zinc-900 bg-zinc-950"}`}>
+            <div className="flex items-center justify-between mb-2.5">
+              <span className="font-semibold text-sm">{a.name}</span>
+              {i === 0 && headroom > 0 && <span className="text-[10px] rounded bg-teal-400 px-1.5 py-0.5 text-zinc-950 font-bold">次おすすめ</span>}
+            </div>
+            <div className="space-y-2">
+              {frames.map((f) => {
+                const pct = f.c.cap > 0 ? (f.remain / f.c.cap) * 100 : 0;
+                const tone = pct > 50 ? "bg-teal-400" : pct > 0 ? "bg-amber-400" : "bg-zinc-700";
+                return (
+                  <div key={f.c.id}>
+                    <div className="flex justify-between text-[11px] mb-1">
+                      <span className="text-zinc-400 truncate pr-1">{f.c.name.replace(/ ?\+?\d+(〜\d+)?%$/, "")}</span>
+                      <span className="num text-zinc-300">残{yen(f.remain)}<span className="text-zinc-600">/{yen(f.c.cap)}</span></span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden"><div className={`h-full rounded-full ${tone}`} style={{ width: `${pct}%` }} /></div>
+                  </div>
+                );
+              })}
+              {frames.length === 0 && <div className="text-[11px] text-zinc-600">上限つきキャンペーンなし</div>}
+            </div>
+            <div className="mt-3 pt-2 border-t border-zinc-800/70 flex justify-between text-[11px]">
+              <span className="text-zinc-500">今月 {monthCount}件</span>
+              <span className="num text-zinc-300">獲得 {yen(monthP)}P</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------- 月次台帳（税理士用） --------------------------- */
+function MonthTab({ accounts, orders, onUpdate, onDelete, flash }) {
+  const accName = (id) => accounts.find((a) => a.id === id)?.name || id;
+  const months = useMemo(() => Array.from(new Set(orders.map((o) => o.date.slice(0, 7)))).sort().reverse(), [orders]);
+  const [sel, setSel] = useState("all");
+
+  const filtered = sel === "all" ? orders : orders.filter((o) => o.date.slice(0, 7) === sel);
+  const rows = [...filtered].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const getP = (o) => (o.actP ?? o.estP);
+
+  const sum = rows.reduce((s, o) => ({
+    gross: s.gross + o.gross, coupon: s.coupon + o.coupon, pointUsed: s.pointUsed + o.pointUsed,
+    cash: s.cash + o.cash, p: s.p + getP(o),
+  }), { gross: 0, coupon: 0, pointUsed: 0, cash: 0, p: 0 });
+
+  // 月別サマリ
+  const summary = months.map((m) => {
+    const os = orders.filter((o) => o.date.slice(0, 7) === m);
+    return {
+      m, count: os.length,
+      cash: os.reduce((s, o) => s + o.cash, 0),
+      pointUsed: os.reduce((s, o) => s + o.pointUsed, 0),
+      p: os.reduce((s, o) => s + getP(o), 0),
+      pending: os.filter((o) => o.status === "処理中").length,
+    };
+  });
+
+  const csv = () => {
+    const head = ["注文日", "垢", "ストア", "注文ID", "商品", "商品合計", "クーポン", "ポイント利用", "現金支払", "獲得P", "状態", "管理用実質原価"];
+    const lines = rows.map((o) => [
+      o.date, accName(o.accountId), q(o.store), q(o.orderId), q(o.item),
+      o.gross, o.coupon, o.pointUsed, o.cash, getP(o), o.status, o.cash - getP(o),
+    ].join(","));
+    const subtotal = ["合計", "", "", "", "", sum.gross, sum.coupon, sum.pointUsed, sum.cash, sum.p, "", sum.cash - sum.p].join(",");
+    const text = [head.join(","), ...lines, subtotal].join("\n");
+    if (navigator?.clipboard) navigator.clipboard.writeText(text).then(() => flash("CSVをコピーした")); else flash("コピー不可");
+  };
+  const q = (s) => `"${String(s || "").replace(/"/g, '""')}"`;
+
+  return (
+    <div className="space-y-5">
+      {/* 月別サマリ */}
+      <div>
+        <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">月別サマリ</div>
+        {summary.length === 0 ? <div className="text-sm text-zinc-600">まだ記録なし</div> : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {summary.map((s) => (
+              <button key={s.m} onClick={() => setSel(s.m)}
+                className={`text-left rounded-lg border p-3 transition ${sel === s.m ? "border-teal-400 bg-teal-500/5" : "border-zinc-800 bg-zinc-900/40 hover:border-zinc-700"}`}>
+                <div className="flex justify-between items-baseline mb-1.5">
+                  <span className="num font-semibold">{s.m}</span>
+                  <span className="text-[11px] text-zinc-500">{s.count}件{s.pending > 0 && <span className="text-amber-400"> ・処理中{s.pending}</span>}</span>
+                </div>
+                <div className="grid grid-cols-3 gap-1 text-[11px]">
+                  <div><div className="text-zinc-600">現金支払</div><div className="num text-zinc-200">¥{yen(s.cash)}</div></div>
+                  <div><div className="text-zinc-600">P利用</div><div className="num text-zinc-300">{yen(s.pointUsed)}</div></div>
+                  <div><div className="text-zinc-600">獲得P</div><div className="num text-teal-400">{yen(s.p)}</div></div>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 明細 */}
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2">
+          <select value={sel} onChange={(e) => setSel(e.target.value)}
+            className="rounded-md bg-zinc-900 border border-zinc-700 px-2 py-1.5 text-sm num focus:border-teal-400 focus:outline-none">
+            <option value="all">全期間</option>
+            {months.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+          <span className="text-[11px] text-zinc-500">{rows.length}件</span>
+        </div>
+        <button onClick={csv} disabled={!rows.length}
+          className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-teal-400 disabled:opacity-30 transition">
+          <Copy size={13} /> 税理士用CSVコピー
+        </button>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-zinc-800 py-16 text-center text-sm text-zinc-600">この期間の記録なし</div>
+      ) : (
+        <div className="overflow-x-auto rounded-lg border border-zinc-800">
+          <table className="w-full text-sm whitespace-nowrap">
+            <thead>
+              <tr className="border-b border-zinc-800 text-[11px] uppercase tracking-wider text-zinc-500">
+                {["日付", "垢", "ストア", "商品", "商品合計", "クーポン", "P利用", "現金支払", "獲得P", "状態", ""].map((h, i) => (
+                  <th key={i} className={`px-3 py-2 font-medium ${i >= 4 && i <= 8 ? "text-right" : "text-left"}`}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((o) => (
+                <tr key={o.id} className="border-b border-zinc-900 hover:bg-zinc-900/40">
+                  <td className="px-3 py-2 num text-zinc-400">{o.date.slice(5)}</td>
+                  <td className="px-3 py-2">{accName(o.accountId)}</td>
+                  <td className="px-3 py-2 text-zinc-400 max-w-[110px] truncate">{o.store}</td>
+                  <td className="px-3 py-2 text-zinc-300 max-w-[140px] truncate">{o.item}</td>
+                  <td className="px-3 py-2 num text-right text-zinc-300">{yen(o.gross)}</td>
+                  <td className="px-3 py-2 num text-right text-zinc-500">{o.coupon ? yen(o.coupon) : "—"}</td>
+                  <td className="px-3 py-2 num text-right text-amber-300/90">{o.pointUsed ? yen(o.pointUsed) : "—"}</td>
+                  <td className="px-3 py-2 num text-right text-zinc-100">{yen(o.cash)}</td>
+                  <td className="px-2 py-2 text-right">
+                    <input inputMode="numeric" value={o.actP ?? ""} placeholder={yen(o.estP)}
+                      onChange={(e) => { const v = e.target.value.replace(/[^\d]/g, ""); onUpdate(o.id, { actP: v === "" ? null : Number(v) }); }}
+                      className={`w-16 bg-transparent border-b text-right num focus:outline-none ${o.actP != null ? "border-teal-500/40 text-teal-400" : "border-zinc-800 text-zinc-500"}`} />
+                  </td>
+                  <td className="px-2 py-2">
+                    <select value={o.status} onChange={(e) => onUpdate(o.id, { status: e.target.value })}
+                      className={`bg-zinc-900 border rounded px-1 py-0.5 text-[11px] focus:outline-none ${o.status === "獲得済" ? "border-teal-500/40 text-teal-400" : "border-amber-500/40 text-amber-300"}`}>
+                      <option>処理中</option><option>獲得済</option>
+                    </select>
+                  </td>
+                  <td className="px-2 py-2 text-right">
+                    <button onClick={() => onDelete(o.id)} className="text-zinc-600 hover:text-rose-400"><Trash2 size={14} /></button>
+                  </td>
+                </tr>
+              ))}
+              <tr className="border-t-2 border-zinc-700 bg-zinc-900/60 font-semibold">
+                <td className="px-3 py-2" colSpan={4}>合計</td>
+                <td className="px-3 py-2 num text-right">{yen(sum.gross)}</td>
+                <td className="px-3 py-2 num text-right text-zinc-400">{yen(sum.coupon)}</td>
+                <td className="px-3 py-2 num text-right text-amber-300/90">{yen(sum.pointUsed)}</td>
+                <td className="px-3 py-2 num text-right">{yen(sum.cash)}</td>
+                <td className="px-3 py-2 num text-right text-teal-400">{yen(sum.p)}</td>
+                <td colSpan={2}></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="text-[11px] text-zinc-600 leading-relaxed">
+        獲得P列は空なら予定値、入力すると確定値で集計。「処理中→獲得済」は獲得明細を見て切替。CSVは商品合計・クーポン・ポイント利用・現金支払・獲得Pを分けてあるので、計上方法は税理士がそのまま判断できる。実質原価は管理用（税務の数字ではない）。
+      </p>
+    </div>
+  );
+}
+
+/* ------------------------------ 設定 ------------------------------ */
+function SettingsTab({ campaigns, setCampaigns, accounts, setAccounts, orders, flash }) {
+  const upd = (id, key, val) => setCampaigns((cs) => cs.map((c) => c.id === id ? { ...c, [key]: val } : c));
+  const addCamp = () => setCampaigns((cs) => [...cs, { id: "c" + Date.now(), name: "新キャンペーン", rate: 4, cap: 2000, period: "day", auto: "manual", entry: true, minOrder: 0, enabled: true }]);
+  const delCamp = (id) => setCampaigns((cs) => cs.filter((c) => c.id !== id));
+  const addAcc = () => setAccounts((a) => [...a, { id: "a" + Date.now(), name: "垢" + String(a.length + 1).padStart(2, "0") }]);
+  const renameAcc = (id, name) => setAccounts((a) => a.map((x) => x.id === id ? { ...x, name } : x));
+  const delAcc = (id) => { if (orders.some((o) => o.accountId === id)) { flash("記録ありの垢は消せへん"); return; } setAccounts((a) => a.filter((x) => x.id !== id)); };
+
+  return (
+    <div className="space-y-8">
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-sm font-semibold">キャンペーン（率・上限）</h2>
+          <button onClick={addCamp} className="flex items-center gap-1 text-xs text-teal-400 hover:text-teal-300"><PlusCircle size={14} /> 追加</button>
+        </div>
+        <p className="text-[11px] text-zinc-500 mb-3">セール時はここの「上限」を黄色欄で書き換える。上限0＝実質無制限。変更は以降の計算に反映。</p>
+        <div className="overflow-x-auto rounded-lg border border-zinc-800">
+          <table className="w-full text-sm">
+            <thead><tr className="border-b border-zinc-800 text-[11px] uppercase tracking-wider text-zinc-500">
+              {["ON", "名称", "率%", "上限(円)", "枠", "自動", "ENT", ""].map((h, i) => <th key={i} className="px-2 py-2 font-medium text-left whitespace-nowrap">{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {campaigns.map((c) => (
+                <tr key={c.id} className="border-b border-zinc-900">
+                  <td className="px-2 py-1.5"><input type="checkbox" checked={c.enabled} onChange={(e) => upd(c.id, "enabled", e.target.checked)} className="accent-teal-400" /></td>
+                  <td className="px-2 py-1.5"><input value={c.name} onChange={(e) => upd(c.id, "name", e.target.value)} className="w-36 bg-transparent border-b border-zinc-800 focus:border-teal-400 focus:outline-none py-0.5" /></td>
+                  <td className="px-2 py-1.5"><input inputMode="decimal" value={c.rate} onChange={(e) => upd(c.id, "rate", Number(e.target.value) || 0)} className="w-12 bg-zinc-900 border border-zinc-700 rounded px-1.5 py-0.5 num focus:border-teal-400 focus:outline-none" /></td>
+                  <td className="px-2 py-1.5"><input inputMode="numeric" value={c.cap} onChange={(e) => upd(c.id, "cap", Number(e.target.value.replace(/[^\d]/g, "")) || 0)} className="w-20 bg-zinc-900 border border-amber-500/40 rounded px-1.5 py-0.5 num text-amber-300 focus:border-amber-400 focus:outline-none" /></td>
+                  <td className="px-2 py-1.5"><select value={c.period} onChange={(e) => upd(c.id, "period", e.target.value)} className="bg-zinc-900 border border-zinc-700 rounded px-1 py-0.5 text-xs focus:border-teal-400 focus:outline-none"><option value="month">月</option><option value="day">日</option><option value="order">注文</option></select></td>
+                  <td className="px-2 py-1.5"><select value={c.auto} onChange={(e) => upd(c.id, "auto", e.target.value)} className="bg-zinc-900 border border-zinc-700 rounded px-1 py-0.5 text-xs focus:border-teal-400 focus:outline-none"><option value="always">毎日</option><option value="day5">5の日</option><option value="sunday">日曜</option><option value="manual">手動</option></select></td>
+                  <td className="px-2 py-1.5 text-center"><input type="checkbox" checked={c.entry} onChange={(e) => upd(c.id, "entry", e.target.checked)} className="accent-amber-400" /></td>
+                  <td className="px-2 py-1.5 text-right"><button onClick={() => delCamp(c.id)} className="text-zinc-600 hover:text-rose-400"><Trash2 size={14} /></button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-sm font-semibold">垢（{accounts.length}）</h2>
+          <button onClick={addAcc} className="flex items-center gap-1 text-xs text-teal-400 hover:text-teal-300"><PlusCircle size={14} /> 追加</button>
+        </div>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2">
+          {accounts.map((a) => (
+            <div key={a.id} className="flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900/40 px-2 py-1.5">
+              <input value={a.name} onChange={(e) => renameAcc(a.id, e.target.value)} className="flex-1 w-full bg-transparent text-sm focus:outline-none" />
+              <button onClick={() => delAcc(a.id)} className="text-zinc-700 hover:text-rose-400"><Trash2 size={13} /></button>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/* ----------------------------- 小物 ----------------------------- */
+function MoneyInput({ v, set, ph, accent }) {
+  return <input inputMode="numeric" value={v} onChange={(e) => set(e.target.value.replace(/[^\d]/g, ""))} placeholder={ph}
+    className={`w-full rounded-md bg-zinc-900 border px-2 py-2 text-sm num focus:outline-none ${accent ? "border-amber-500/40 text-amber-300 focus:border-amber-400" : "border-zinc-700 focus:border-teal-400"}`} />;
+}
+function Field({ label, hint, children }) {
+  return (<label className="block">
+    <div className="flex items-baseline gap-1.5 mb-1"><span className="text-[11px] uppercase tracking-wider text-zinc-500">{label}</span>{hint && <span className="text-[10px] text-zinc-600">{hint}</span>}</div>
+    {children}
+  </label>);
+}
+function Row({ label, children }) {
+  return <div className="flex items-center justify-between"><span className="text-xs text-zinc-500">{label}</span>{children}</div>;
+}
