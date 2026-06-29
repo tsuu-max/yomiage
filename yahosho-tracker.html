@@ -33,6 +33,29 @@
      * ================================================================== */
 
     const STORAGE_KEY = "yahoo-cap-tracker:state-v1";
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbyRx7xAf8RfgP-vCARImSWTOy0sxLnsi8unCABfyLIhOjLLYvCj3NL6AePS-CAX2NuK/exec";
+
+    function syncToSheets(o, accName) {
+      fetch(GAS_URL, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          date:      o.date,
+          account:   accName,
+          store:     o.store,
+          orderId:   o.orderId,
+          item:      o.item,
+          gross:     o.gross,
+          coupon:    o.coupon,
+          pointUsed: o.pointUsed,
+          cash:      o.cash,
+          estP:      o.estP,
+          actP:      o.actP,
+          status:    o.status,
+        }),
+      }).catch(() => {});
+    }
 
     function loadState() {
       try { const v = localStorage.getItem(STORAGE_KEY); if(v) return JSON.parse(v); } catch(e) {}
@@ -165,7 +188,13 @@
 
           <main className="mx-auto max-w-5xl px-4 py-5">
             {tab === "input" && <InputTab accounts={accounts} campaigns={campaigns} calcOrder={calcOrder}
-              onRecord={(o) => { setOrders((p) => [o, ...p]); flash("記録した"); setTab("month"); }} />}
+              onRecord={(o) => {
+                setOrders((p) => [o, ...p]);
+                const name = accounts.find((a) => a.id === o.accountId)?.name || o.accountId;
+                syncToSheets(o, name);
+                flash("記録した（台帳に転記中）");
+                setTab("month");
+              }} />}
             {tab === "dash" && <DashTab accounts={accounts} campaigns={campaigns} orders={orders} consumed={consumed} />}
             {tab === "month" && <MonthTab accounts={accounts} orders={orders}
               onUpdate={(id, patch) => setOrders((p) => p.map((o) => o.id === id ? { ...o, ...patch } : o))}
